@@ -67,19 +67,6 @@ Output is a single timestamped NDJSON file (`driving_events_YYYYMMDD_HHMMSS.json
 
 In the full pipeline this script is called by the Airflow `PythonOperator` in the DAG, which passes the arguments and then hands the output path to the next task for upload to GCS.
 
----
-
-## GCP setup
-
-| Service | Purpose |
-|---|---|
-| Cloud Storage | Staging area for raw simulator output and Spark job artifacts |
-| Dataproc | Runs the PySpark transformation job |
-| Cloud Composer | Orchestrates the full pipeline end to end |
-| BigQuery | Final destination for cleaned, partitioned data |
-| Looker | Reporting and dashboards on top of BigQuery |
-
----
 
 ## Data
 
