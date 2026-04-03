@@ -1,6 +1,6 @@
 # Car Fleet Pipeline
 
-A batch data pipeline that simulates autonomous vehicle telemetry, processes it at scale, and produces an analytics-ready dataset in BigQuery. Built on GCP using Cloud Storage, Dataproc, Cloud Composer, and BigQuery, with Looker as the reporting layer.
+A data pipeline that simulates autonomous vehicle telemetry, processes it at scale, and produces an analytics-ready dataset in BigQuery. Supports both a batch path and a real-time streaming path. Built on GCP using Cloud Storage, Dataproc, Dataflow, Cloud Pub/Sub, Cloud Composer, and BigQuery, with Looker as the reporting layer.
 
 ---
 
@@ -14,6 +14,9 @@ The whole thing is orchestrated by Cloud Composer (managed Airflow). The simulat
 
 ## Pipeline architecture
 
+There are two paths. They share the same simulator and write to the same BigQuery dataset, but differ in how data moves and how fast it arrives.
+
+**Batch**
 ```
 Simulator (PythonOperator)
         |
@@ -24,11 +27,38 @@ Cloud Storage (raw NDJSON)
 Dataproc (PySpark — clean, transform, partition)
         |
         v
-BigQuery (analytics dataset)
+BigQuery (bulk load)
         |
         v
 Looker (dashboards / reports)
 ```
+
+**Real-time**
+```
+Simulator (streaming mode)
+        |
+        v
+Cloud Pub/Sub (ingestion topic)
+        |
+        v
+Dataflow (Beam streaming job — validate, transform, window)
+        |          |
+        v          v
+  BigQuery    Pub/Sub dead-letter topic (bad records)
+  (streaming
+   inserts)
+        |
+        v
+Looker (near-real-time dashboards)
+```
+
+| Concern | Batch | Real-time |
+|---|---|---|
+| Ingestion | GCS (NDJSON file) | Pub/Sub topic |
+| Processing | Dataproc / PySpark | Dataflow / Apache Beam |
+| Orchestration | Cloud Composer (Airflow) | Dataflow job runs continuously |
+| BQ write method | Bulk load job | Streaming inserts |
+| Latency | Minutes to hours | Seconds |
 
 ---
 
@@ -65,8 +95,52 @@ python simulator/generate_events.py \
 
 Output is a single timestamped NDJSON file (`driving_events_YYYYMMDD_HHMMSS.json`). The format is compatible with both BigQuery direct load and Spark ingestion.
 
-In the full pipeline this script is called by the Airflow `PythonOperator` in the DAG, which passes the arguments and then hands the output path to the next task for upload to GCS.
+In the batch pipeline this script is called by the Airflow `PythonOperator` in the DAG, which passes the arguments and then hands the output path to the next task for upload to GCS.
 
+In streaming mode (`--mode streaming`), the simulator publishes each event as a JSON message directly to a Pub/Sub topic instead of writing to disk. The core event generation logic is the same either way.
+
+---
+
+## Real-time pipeline
+
+### Pub/Sub
+
+Two topics are needed:
+
+- `fleet-events` — the main ingestion topic. The simulator publishes to this in streaming mode.
+- `fleet-events-deadletter` — receives records that fail validation in the Dataflow job, rather than silently dropping them. Bad records can be inspected or replayed from here.
+
+### Dataflow job
+
+The Dataflow job is an Apache Beam streaming pipeline that:
+
+1. Reads from the `fleet-events` subscription
+2. Parses and validates each message — applying the same checks as the Spark batch job (null vehicle IDs, invalid timestamps, out-of-range sensor values, etc.)
+3. Routes bad records to the dead-letter topic
+4. Applies windowing (1-minute tumbling windows) for any aggregations
+5. Writes clean records to BigQuery via streaming inserts
+
+Because the Dataflow job runs continuously, it does not go through Cloud Composer. It is deployed separately and stays live as long as the simulator is publishing.
+
+### BigQuery
+
+Streaming inserts land in the same dataset as the batch pipeline. The two paths are differentiated by a `pipeline_mode` field (`batch` or `streaming`) added during transformation, so Looker can filter or compare them.
+
+---
+
+## GCP setup
+
+| Service | Purpose |
+|---|---|
+| Cloud Storage | Staging area for raw simulator output and Spark job artifacts (batch path) |
+| Dataproc | Runs the PySpark transformation job (batch path) |
+| Cloud Pub/Sub | Event ingestion and dead-letter queue (real-time path) |
+| Dataflow | Runs the Apache Beam streaming job (real-time path) |
+| Cloud Composer | Orchestrates the batch pipeline end to end |
+| BigQuery | Final destination for cleaned data from both paths |
+| Looker | Reporting and dashboards on top of BigQuery |
+
+---
 
 ## Data
 
